@@ -5,8 +5,10 @@ Tracks capital deployed from treasury wallets into strategy wallets.
 Stablecoin-first, multi-asset ready (see PRICES / asset classification).
 
 Run:
-    export ETHERSCAN_API_KEY=...        # optional, demo mode works without
     streamlit run treasury_dashboard.py
+
+API key is hardcoded below for the POC. Move it to st.secrets or an env var
+before this repo goes anywhere shared.
 
 Data source: Etherscan V2 multichain API (one key, chainid switch).
 Swap `EtherscanClient` for Covalent/Alchemy/an indexer without touching the UI.
@@ -31,6 +33,9 @@ import altair as alt
 # ----------------------------------------------------------------------------
 
 ETHERSCAN_BASE = "https://api.etherscan.io/v2/api"
+
+# POC only. Overridden by the ETHERSCAN_API_KEY env var or st.secrets if either is set.
+HARDCODED_API_KEY = "PU98SQABT31XGYWM7W6D66JWS4D3WPSUQ6"
 
 CHAINS = {
     "Ethereum": 1,
@@ -365,6 +370,19 @@ def fmt_usd(x) -> str:
 # Sidebar
 # ----------------------------------------------------------------------------
 
+def resolve_api_key() -> str:
+    """env var > st.secrets > hardcoded POC key."""
+    if os.environ.get("ETHERSCAN_API_KEY"):
+        return os.environ["ETHERSCAN_API_KEY"]
+    try:
+        if "ETHERSCAN_API_KEY" in st.secrets:
+            return str(st.secrets["ETHERSCAN_API_KEY"])
+    except Exception:  # no secrets.toml present, which is fine
+        pass
+    return HARDCODED_API_KEY
+
+
+
 def parse_wallets(text: str, kind: str) -> list[Wallet]:
     out = []
     for line in text.strip().splitlines():
@@ -389,7 +407,7 @@ with st.sidebar:
 
     api_key = st.text_input(
         "Etherscan API key",
-        value=os.environ.get("ETHERSCAN_API_KEY", ""),
+        value=resolve_api_key(),
         type="password",
         help="One V2 key covers all chains. Leave blank to run on demo data.",
     )
