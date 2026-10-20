@@ -2,7 +2,10 @@
 Treasury Management Dashboard (POC)
 
 Tracks capital deployed from treasury wallets into strategy wallets.
-Stablecoin-first, multi-asset ready (see PRICES / asset classification).
+Stablecoin-first, multi-asset ready (see STABLES / PRICE_OVERRIDES).
+
+P&L is deliberately out of scope here. This answers "where is the capital
+and when did it move", nothing more.
 
 Run:
     streamlit run treasury_dashboard.py
@@ -11,14 +14,13 @@ API key is hardcoded below for the POC. Move it to st.secrets or an env var
 before this repo goes anywhere shared.
 
 Data source: Etherscan V2 multichain API (one key, chainid switch).
-Swap `EtherscanClient` for Covalent/Alchemy/an indexer without touching the UI.
+Swap `fetch_token_transfers` for Covalent/Alchemy/an indexer without touching the UI.
 """
 
 from __future__ import annotations
 
 import os
 import time
-import json
 import random
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -76,7 +78,12 @@ DEFAULT_STRATEGY = {
     "Strategy 2": "0x5e13D8BBA207a9c21BCE74263d8A2079a143440A",
 }
 
-st.set_page_config(page_title="Treasury Dashboard", page_icon="🏦", layout="wide")
+st.set_page_config(
+    page_title="Treasury Dashboard",
+    page_icon="🏦",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 
 # ----------------------------------------------------------------------------
@@ -109,6 +116,18 @@ class RateLimiter:
 
 
 _limiter = RateLimiter()
+
+
+def resolve_api_key() -> str:
+    """env var > st.secrets > hardcoded POC key."""
+    if os.environ.get("ETHERSCAN_API_KEY"):
+        return os.environ["ETHERSCAN_API_KEY"]
+    try:
+        if "ETHERSCAN_API_KEY" in st.secrets:
+            return str(st.secrets["ETHERSCAN_API_KEY"])
+    except Exception:  # no secrets.toml present, which is fine
+        pass
+    return HARDCODED_API_KEY
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -161,7 +180,7 @@ def fetch_token_transfers(address: str, chain_id: int, api_key: str) -> list[dic
 
 
 def synthetic_transfers(wallets: list[Wallet], chain_id: int) -> list[dict]:
-    """Deterministic fake history so the POC is demoable without an API key."""
+    """Deterministic fake history so the POC is demoable without burning API calls."""
     rng = random.Random(7)
     treasury = [w for w in wallets if w.kind == "treasury"]
     strategies = [w for w in wallets if w.kind == "strategy"]
@@ -299,53 +318,28 @@ def strategy_summary(df: pd.DataFrame, wallets: list[Wallet]) -> pd.DataFrame:
         flows = tf[tf["wallet"] == s.label]
         deployed = flows.loc[flows.direction == "IN", "usd"].sum()
         returned = flows.loc[flows.direction == "OUT", "usd"].sum()
-        net = deployed - returned
         balance = sub["signed_usd"].sum()  # reconstructed from full transfer history
         external_out = sub[(sub.counterparty_kind == "external") & (sub.direction == "OUT")]["usd"].sum()
         external_in = sub[(sub.counterparty_kind == "external") & (sub.direction == "IN")]["usd"].sum()
-        pnl = balance - net
         first = flows["timestamp"].min() if not flows.empty else pd.NaT
         last = sub["timestamp"].max() if not sub.empty else pd.NaT
-        days = (now - first).days if pd.notna(first) else 0
 
         rows.append({
-            "Strategy": s.label,
+            "Strategy wallet": s.label,
             "Address": s.address,
-            "Net deployed": net,
+            "Net deployed": deployed - returned,
             "Gross deployed": deployed,
             "Returned to treasury": returned,
             "Current balance": balance,
-            "Implied P&L": pnl,
-            "Return %": (pnl / net * 100) if net else float("nan"),
-            "Ann. (Dietz) %": modified_dietz(flows, balance) * 100 if net else float("nan"),
             "Deployed to venues": external_out,
             "Received from venues": external_in,
             "Transfers": len(sub),
             "First funded": first,
             "Last activity": last,
             "Days since activity": (now - last).days if pd.notna(last) else None,
-            "Days deployed": days,
+            "Days deployed": (now - first).days if pd.notna(first) else 0,
         })
     return pd.DataFrame(rows)
-
-
-def modified_dietz(flows: pd.DataFrame, end_value: float) -> float:
-    """Annualized time-weighted-ish return using treasury flows as the only cashflows."""
-    if flows.empty:
-        return float("nan")
-    start = flows["timestamp"].min()
-    end = pd.Timestamp.now(tz="UTC")
-    total_days = max((end - start).days, 1)
-
-    cf = flows.assign(signed=lambda d: d["usd"].where(d.direction == "IN", -d["usd"]))
-    net_cf = cf["signed"].sum()
-    weights = cf["timestamp"].map(lambda t: (end - t).days / total_days)
-    weighted = float((cf["signed"] * weights).sum())
-    denom = weighted
-    if denom <= 0:
-        return float("nan")
-    r = (end_value - net_cf) / denom
-    return (1 + r) ** (365 / total_days) - 1 if r > -1 else float("nan")
 
 
 def running_balance(df: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -366,23 +360,6 @@ def fmt_usd(x) -> str:
     return f"${x:,.0f}"
 
 
-# ----------------------------------------------------------------------------
-# Sidebar
-# ----------------------------------------------------------------------------
-
-def resolve_api_key() -> str:
-    """env var > st.secrets > hardcoded POC key."""
-    if os.environ.get("ETHERSCAN_API_KEY"):
-        return os.environ["ETHERSCAN_API_KEY"]
-    try:
-        if "ETHERSCAN_API_KEY" in st.secrets:
-            return str(st.secrets["ETHERSCAN_API_KEY"])
-    except Exception:  # no secrets.toml present, which is fine
-        pass
-    return HARDCODED_API_KEY
-
-
-
 def parse_wallets(text: str, kind: str) -> list[Wallet]:
     out = []
     for line in text.strip().splitlines():
@@ -398,43 +375,42 @@ def parse_wallets(text: str, kind: str) -> list[Wallet]:
     return out
 
 
-with st.sidebar:
-    st.header("Configuration")
+# ----------------------------------------------------------------------------
+# Configuration panel (inline, no sidebar)
+# ----------------------------------------------------------------------------
 
-    chain_name = st.selectbox("Chain", list(CHAINS), index=0)
-    chain_id = CHAINS[chain_name]
-    explorer = EXPLORERS[chain_id]
+st.title("Treasury Management Dashboard")
 
-    api_key = st.text_input(
-        "Etherscan API key",
-        value=resolve_api_key(),
-        type="password",
-        help="One V2 key covers all chains. Leave blank to run on demo data.",
-    )
-    demo = st.toggle("Demo mode (synthetic data)", value=not bool(api_key))
+first_run = "configured" not in st.session_state
+st.session_state["configured"] = True
 
-    st.divider()
-    st.caption("One wallet per line, `Label, 0xaddress`")
-    treasury_text = st.text_area(
+with st.expander("Configuration", expanded=first_run):
+    r1 = st.columns([1, 2, 1, 1])
+    chain_name = r1[0].selectbox("Chain", list(CHAINS), index=0)
+    api_key = r1[1].text_input("Etherscan API key", value=resolve_api_key(), type="password")
+    asset_mode = r1[2].selectbox("Assets", ["Stablecoins only", "All assets"], index=0)
+    demo = r1[3].toggle("Demo data", value=False, help="Synthetic history, no API calls.")
+
+    r2 = st.columns(2)
+    treasury_text = r2[0].text_area(
         "Treasury wallets",
         "\n".join(f"{k}, {v}" for k, v in DEFAULT_TREASURY.items()),
-        height=80,
+        height=110,
+        help="One per line: `Label, 0xaddress`",
     )
-    strategy_text = st.text_area(
+    strategy_text = r2[1].text_area(
         "Strategy wallets",
         "\n".join(f"{k}, {v}" for k, v in DEFAULT_STRATEGY.items()),
         height=110,
+        help="One per line: `Label, 0xaddress`",
     )
 
-    st.divider()
-    asset_mode = st.radio("Assets", ["Stablecoins only", "All assets"], index=0)
-    large_threshold = st.number_input("Large transfer alert ($)", value=1_000_000, step=100_000)
-    idle_days = st.number_input("Idle wallet alert (days)", value=30, step=5)
-
-    if st.button("Refresh data", width="stretch"):
+    if st.button("Refresh data"):
         st.cache_data.clear()
         st.rerun()
 
+chain_id = CHAINS[chain_name]
+explorer = EXPLORERS[chain_id]
 wallets = parse_wallets(treasury_text, "treasury") + parse_wallets(strategy_text, "strategy")
 
 if not wallets:
@@ -455,7 +431,7 @@ if demo:
         raw[w.address] = [r for r in rows if r["from"].lower() == a or r["to"].lower() == a]
 else:
     if not api_key:
-        st.error("Provide an Etherscan API key or enable demo mode.")
+        st.error("Provide an Etherscan API key or switch on demo data.")
         st.stop()
     prog = st.progress(0.0, text="Pulling transfers...")
     for i, w in enumerate(wallets):
@@ -473,7 +449,7 @@ for e in errors:
 ledger = build_ledger(raw, wallets)
 
 if ledger.empty:
-    st.info("No ERC-20 transfers found for these wallets on this chain.")
+    st.info(f"No ERC-20 transfers found for these wallets on {chain_name}. Try another chain.")
     st.stop()
 
 if asset_mode == "Stablecoins only":
@@ -491,26 +467,28 @@ tf = treasury_flows(ledger)
 # Header
 # ----------------------------------------------------------------------------
 
-st.title("Treasury Management Dashboard")
+treasury_balance = ledger[ledger.wallet_kind == "treasury"]["signed_usd"].sum()
+strategy_balance = summary["Current balance"].sum()
+total_balance = treasury_balance + strategy_balance
+deployed_total = summary["Net deployed"].sum()
+denom = max(treasury_balance, 0) + deployed_total
+util = (deployed_total / denom * 100) if denom else float("nan")
+
 st.caption(
     f"{chain_name} · {len(wallets)} wallets · {len(ledger):,} transfers · "
     f"{'demo data' if demo else 'live'} · {asset_mode.lower()}"
 )
 
-c1, c2, c3, c4, c5 = st.columns(5)
-treas_balance = ledger[ledger.wallet_kind == "treasury"]["signed_usd"].sum()
-c1.metric("Treasury balance", fmt_usd(treas_balance))
-c2.metric("Net deployed", fmt_usd(summary["Net deployed"].sum()))
-c3.metric("Strategy balances", fmt_usd(summary["Current balance"].sum()))
-c4.metric("Implied P&L", fmt_usd(summary["Implied P&L"].sum()))
-deployed_total = summary["Net deployed"].sum()
-denom = max(treas_balance, 0) + deployed_total
-util = (deployed_total / denom * 100) if denom else float("nan")
-c5.metric("Capital utilization", f"{util:.1f}%" if pd.notna(util) else "-",
-          help="Net deployed / (idle treasury + net deployed)")
+c = st.columns(5)
+c[0].metric("Total capital", fmt_usd(total_balance), help="Treasury balance plus all strategy balances")
+c[1].metric("Treasury balance", fmt_usd(treasury_balance))
+c[2].metric("Strategy balances", fmt_usd(strategy_balance))
+c[3].metric("Net deployed", fmt_usd(deployed_total))
+c[4].metric("Capital utilization", f"{util:.1f}%" if pd.notna(util) else "-",
+            help="Net deployed / (idle treasury + net deployed)")
 
-tab_overview, tab_detail, tab_flows, tab_alerts, tab_ledger = st.tabs(
-    ["Overview", "Strategy detail", "Flow matrix", "Alerts", "Raw ledger"]
+tab_overview, tab_detail, tab_flows, tab_ledger = st.tabs(
+    ["Overview", "Strategy detail", "Flow matrix", "Raw ledger"]
 )
 
 # ----------------------------------------------------------------------------
@@ -518,13 +496,13 @@ tab_overview, tab_detail, tab_flows, tab_alerts, tab_ledger = st.tabs(
 # ----------------------------------------------------------------------------
 
 with tab_overview:
-    st.subheader("Strategy positions")
+    st.subheader("Strategy wallet positions")
     st.caption("Click a row to open it in Strategy detail.")
 
     display = summary[[
-        "Strategy", "Net deployed", "Current balance", "Implied P&L", "Return %",
-        "Ann. (Dietz) %", "Gross deployed", "Returned to treasury",
-        "Transfers", "Days since activity",
+        "Strategy wallet", "Net deployed", "Current balance", "Gross deployed",
+        "Returned to treasury", "Deployed to venues", "Received from venues",
+        "Transfers", "Days deployed", "Days since activity",
     ]]
 
     event = st.dataframe(
@@ -534,59 +512,53 @@ with tab_overview:
         on_select="rerun",
         selection_mode="single-row",
         column_config={
-            "Net deployed": st.column_config.NumberColumn(format="$%.0f"),
-            "Current balance": st.column_config.NumberColumn(format="$%.0f"),
-            "Implied P&L": st.column_config.NumberColumn(format="$%.0f"),
-            "Gross deployed": st.column_config.NumberColumn(format="$%.0f"),
-            "Returned to treasury": st.column_config.NumberColumn(format="$%.0f"),
-            "Return %": st.column_config.NumberColumn(format="%.2f%%"),
-            "Ann. (Dietz) %": st.column_config.NumberColumn(format="%.2f%%"),
+            col: st.column_config.NumberColumn(format="$%.0f")
+            for col in ["Net deployed", "Current balance", "Gross deployed",
+                        "Returned to treasury", "Deployed to venues", "Received from venues"]
         },
     )
     if event.selection.rows:
-        st.session_state["selected_strategy"] = summary.iloc[event.selection.rows[0]]["Strategy"]
+        st.session_state["selected_strategy"] = summary.iloc[event.selection.rows[0]]["Strategy wallet"]
         st.info(f"Selected **{st.session_state['selected_strategy']}** — open the Strategy detail tab.")
 
     left, right = st.columns(2)
 
     with left:
         st.subheader("Cumulative net deployed")
-        series = []
-        for s in summary["Strategy"]:
-            rb = running_balance(ledger, s)
-            if rb.empty:
-                continue
-            series.append(rb[["timestamp", "net_deployed"]].assign(Strategy=s))
+        series = [
+            running_balance(ledger, s)[["timestamp", "net_deployed"]].assign(Wallet=s)
+            for s in summary["Strategy wallet"]
+            if not running_balance(ledger, s).empty
+        ]
         if series:
             chart_df = pd.concat(series)
             st.altair_chart(
                 alt.Chart(chart_df).mark_line(interpolate="step-after").encode(
                     x=alt.X("timestamp:T", title=None),
                     y=alt.Y("net_deployed:Q", title="USD", axis=alt.Axis(format="$,.0s")),
-                    color=alt.Color("Strategy:N", legend=alt.Legend(orient="bottom")),
-                    tooltip=["Strategy", "timestamp:T", alt.Tooltip("net_deployed:Q", format="$,.0f")],
+                    color=alt.Color("Wallet:N", legend=alt.Legend(orient="bottom")),
+                    tooltip=["Wallet", "timestamp:T", alt.Tooltip("net_deployed:Q", format="$,.0f")],
                 ).properties(height=300),
-                width="stretch",
+                use_container_width=True,
             )
 
     with right:
-        st.subheader("Balance vs deployed capital")
-        series = []
-        for s in summary["Strategy"]:
-            rb = running_balance(ledger, s)
-            if rb.empty:
-                continue
-            series.append(rb[["timestamp", "balance"]].assign(Strategy=s))
+        st.subheader("Wallet balances over time")
+        series = [
+            running_balance(ledger, w)[["timestamp", "balance"]].assign(Wallet=w)
+            for w in ledger["wallet"].unique()
+            if not running_balance(ledger, w).empty
+        ]
         if series:
             chart_df = pd.concat(series)
             st.altair_chart(
                 alt.Chart(chart_df).mark_line().encode(
                     x=alt.X("timestamp:T", title=None),
                     y=alt.Y("balance:Q", title="USD", axis=alt.Axis(format="$,.0s")),
-                    color=alt.Color("Strategy:N", legend=alt.Legend(orient="bottom")),
-                    tooltip=["Strategy", "timestamp:T", alt.Tooltip("balance:Q", format="$,.0f")],
+                    color=alt.Color("Wallet:N", legend=alt.Legend(orient="bottom")),
+                    tooltip=["Wallet", "timestamp:T", alt.Tooltip("balance:Q", format="$,.0f")],
                 ).properties(height=300),
-                width="stretch",
+                use_container_width=True,
             )
 
     st.subheader("Net deployed by asset")
@@ -594,6 +566,7 @@ with tab_overview:
         tf.assign(signed=lambda d: d["usd"].where(d.direction == "IN", -d["usd"]))
         .pivot_table(index="wallet", columns="asset", values="signed", aggfunc="sum", fill_value=0)
     )
+    by_asset.index.name = "Strategy wallet"
     st.dataframe(by_asset.style.format("${:,.0f}"), width="stretch")
 
 # ----------------------------------------------------------------------------
@@ -601,21 +574,20 @@ with tab_overview:
 # ----------------------------------------------------------------------------
 
 with tab_detail:
-    options = list(summary["Strategy"])
+    options = list(summary["Strategy wallet"])
     default_idx = options.index(st.session_state["selected_strategy"]) \
         if st.session_state.get("selected_strategy") in options else 0
-    chosen = st.selectbox("Strategy", options, index=default_idx)
-    row = summary[summary["Strategy"] == chosen].iloc[0]
+    chosen = st.selectbox("Strategy wallet", options, index=default_idx)
+    row = summary[summary["Strategy wallet"] == chosen].iloc[0]
 
     st.markdown(f"`{row['Address']}` · [explorer]({explorer}/address/{row['Address']})")
 
     m = st.columns(6)
     m[0].metric("Net deployed", fmt_usd(row["Net deployed"]))
-    m[1].metric("Balance", fmt_usd(row["Current balance"]))
-    m[2].metric("Implied P&L", fmt_usd(row["Implied P&L"]),
-                f"{row['Return %']:.2f}%" if pd.notna(row["Return %"]) else None)
-    m[3].metric("Days deployed", int(row["Days deployed"]))
-    m[4].metric("Deployed to venues", fmt_usd(row["Deployed to venues"]))
+    m[1].metric("Current balance", fmt_usd(row["Current balance"]))
+    m[2].metric("Returned to treasury", fmt_usd(row["Returned to treasury"]))
+    m[3].metric("Deployed to venues", fmt_usd(row["Deployed to venues"]))
+    m[4].metric("Days deployed", int(row["Days deployed"]))
     m[5].metric("Last activity",
                 row["Last activity"].strftime("%Y-%m-%d") if pd.notna(row["Last activity"]) else "-")
 
@@ -658,24 +630,8 @@ with tab_detail:
         },
     )
 
-    st.subheader("Counterparty concentration")
-    cp = (all_act[all_act.counterparty_kind == "external"]
-          .groupby("counterparty")
-          .agg(volume=("usd", "sum"), transfers=("usd", "size"),
-               last_seen=("timestamp", "max"))
-          .sort_values("volume", ascending=False)
-          .reset_index())
-    if cp.empty:
-        st.caption("No external counterparties.")
-    else:
-        cp["Explorer"] = cp["counterparty"].map(lambda a: f"{explorer}/address/{a}")
-        st.dataframe(cp, hide_index=True, width="stretch", column_config={
-            "volume": st.column_config.NumberColumn("Volume", format="$%.0f"),
-            "Explorer": st.column_config.LinkColumn(display_text="view"),
-        })
-
     st.download_button(
-        "Download strategy ledger (CSV)",
+        "Download wallet ledger (CSV)",
         all_act.to_csv(index=False).encode(),
         file_name=f"{chosen.replace(' ', '_')}_ledger.csv",
         mime="text/csv",
@@ -694,6 +650,7 @@ with tab_flows:
     )
     matrix["Total"] = matrix.sum(axis=1)
     matrix.loc["Total"] = matrix.sum()
+    matrix.index.name = "Treasury wallet"
     st.dataframe(matrix.style.format("${:,.0f}"), width="stretch")
 
     st.subheader("Monthly funding cadence")
@@ -706,92 +663,45 @@ with tab_flows:
             alt.Chart(agg).mark_bar().encode(
                 x=alt.X("yearmonth(month):O", title=None),
                 y=alt.Y("signed:Q", title="Net flow (USD)", axis=alt.Axis(format="$,.0s")),
-                color=alt.Color("wallet:N", title="Strategy", legend=alt.Legend(orient="bottom")),
+                color=alt.Color("wallet:N", title="Strategy wallet", legend=alt.Legend(orient="bottom")),
                 tooltip=["wallet", alt.Tooltip("signed:Q", format="$,.0f")],
             ).properties(height=300),
-            width="stretch",
+            use_container_width=True,
         )
 
+    st.subheader("Asset exposure by wallet")
+    exposure = ledger.pivot_table(index="wallet", columns="asset",
+                                  values="signed_usd", aggfunc="sum", fill_value=0)
+    exposure["Total"] = exposure.sum(axis=1)
+    exposure.loc["Total"] = exposure.sum()
+    exposure.index.name = "Wallet"
+    st.dataframe(exposure.style.format("${:,.0f}"), width="stretch")
+
     st.subheader("Reconciliation")
-    recon = summary[["Strategy", "Net deployed", "Deployed to venues",
-                     "Received from venues", "Current balance", "Implied P&L"]].copy()
+    recon = summary[["Strategy wallet", "Net deployed", "Deployed to venues",
+                     "Received from venues", "Current balance"]].copy()
     recon["Check"] = (
         recon["Net deployed"] - recon["Deployed to venues"]
         + recon["Received from venues"] - recon["Current balance"]
     ).round(2)
     st.dataframe(recon, hide_index=True, width="stretch", column_config={
-        c: st.column_config.NumberColumn(format="$%.0f")
-        for c in recon.columns if c != "Strategy"
+        col: st.column_config.NumberColumn(format="$%.0f")
+        for col in recon.columns if col != "Strategy wallet"
     })
     st.caption(
         "Balance is reconstructed from the full transfer history. "
-        "Check should be ~0; non-zero means missing history, rebasing tokens, or an unpriced asset."
+        "Check should be ~0; non-zero means missing history, a rebasing token, or an unpriced asset."
     )
-
-# ----------------------------------------------------------------------------
-# Alerts
-# ----------------------------------------------------------------------------
-
-with tab_alerts:
-    st.subheader("Exceptions")
-    alerts = []
-
-    big = ledger[ledger["usd"] >= large_threshold]
-    for _, r in big.sort_values("timestamp", ascending=False).head(25).iterrows():
-        alerts.append({
-            "Severity": "Info", "Type": "Large transfer",
-            "Detail": f"{r['wallet']} {r['direction']} {fmt_usd(r['usd'])} {r['asset']} "
-                      f"with {r['counterparty_label']}",
-            "When": r["timestamp"],
-        })
-
-    for _, r in summary.iterrows():
-        if r["Days since activity"] is not None and r["Days since activity"] > idle_days and r["Current balance"] > 0:
-            alerts.append({
-                "Severity": "Warn", "Type": "Idle capital",
-                "Detail": f"{r['Strategy']} holds {fmt_usd(r['Current balance'])} "
-                          f"with no activity for {int(r['Days since activity'])} days",
-                "When": r["Last activity"],
-            })
-        if pd.notna(r["Implied P&L"]) and r["Net deployed"] and r["Implied P&L"] < -0.02 * r["Net deployed"]:
-            alerts.append({
-                "Severity": "Warn", "Type": "Drawdown",
-                "Detail": f"{r['Strategy']} below funded capital by {fmt_usd(abs(r['Implied P&L']))} "
-                          f"({r['Return %']:.2f}%)",
-                "When": r["Last activity"],
-            })
-
-    # Strategy sending funds to an address that is neither treasury nor a known venue
-    first_seen = (ledger[ledger.counterparty_kind == "external"]
-                  .groupby("counterparty")["timestamp"].min())
-    recent_new = first_seen[first_seen > pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=14)]
-    for addr, ts in recent_new.items():
-        alerts.append({
-            "Severity": "Info", "Type": "New counterparty",
-            "Detail": f"First interaction with {addr}",
-            "When": ts,
-        })
-
-    if alerts:
-        adf = pd.DataFrame(alerts).sort_values("When", ascending=False)
-        st.dataframe(adf, hide_index=True, width="stretch")
-    else:
-        st.success("No exceptions.")
-
-    st.subheader("Asset exposure by wallet")
-    exposure = ledger.pivot_table(index="wallet", columns="asset",
-                                  values="signed_usd", aggfunc="sum", fill_value=0)
-    st.dataframe(exposure.style.format("${:,.0f}"), width="stretch")
 
 # ----------------------------------------------------------------------------
 # Raw ledger
 # ----------------------------------------------------------------------------
 
 with tab_ledger:
-    f1, f2, f3 = st.columns(3)
-    w_filter = f1.multiselect("Wallet", sorted(ledger["wallet"].unique()))
-    a_filter = f2.multiselect("Asset", sorted(ledger["asset"].unique()))
-    k_filter = f3.multiselect("Counterparty type", ["treasury", "strategy", "external"])
+    f = st.columns(3)
+    w_filter = f[0].multiselect("Wallet", sorted(ledger["wallet"].unique()))
+    a_filter = f[1].multiselect("Asset", sorted(ledger["asset"].unique()))
+    k_filter = f[2].multiselect("Counterparty type", ["treasury", "strategy", "external"])
 
     view = ledger.copy()
     if w_filter:
