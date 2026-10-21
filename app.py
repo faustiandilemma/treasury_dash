@@ -324,8 +324,12 @@ with st.expander("Configuration", expanded=first_run):
     c = st.columns([1, 2, 1, 1])
     chain_name = c[0].selectbox("Chain", list(CHAINS), index=0)
     api_key = c[1].text_input("Etherscan API key", value=resolve_api_key(), type="password")
-    opening_date = c[2].date_input("Opening date", value=date(2026, 1, 1),
-                                   help="Balances before this date are the opening position.")
+    opening_mode = c[2].selectbox(
+        "Opening", ["First treasury funding", "Custom date"],
+        help="What counts as the opening position. Everything at or before it is "
+             "opening; everything after is flow.")
+    opening_date = c[2].date_input("Custom opening date", value=date(2026, 1, 1),
+                                   disabled=opening_mode != "Custom date")
     demo = c[3].toggle("Demo data", value=False)
 
     w = st.columns(2)
@@ -343,7 +347,6 @@ with st.expander("Configuration", expanded=first_run):
 
 chain_id = CHAINS[chain_name]
 explorer = EXPLORERS[chain_id]
-opening_ts = pd.Timestamp(opening_date, tz="UTC")
 extra_ok = {l.strip().lower() for l in extra_text.splitlines()
             if l.strip().startswith("0x")}
 
@@ -393,6 +396,22 @@ if ledger.empty:
                  hide_index=True, width="stretch")
     st.stop()
 
+def resolve_opening(df: pd.DataFrame) -> tuple[pd.Timestamp, str]:
+    """First treasury funding is the earliest inbound transfer to a treasury wallet
+    from an address that is neither treasury nor strategy."""
+    if opening_mode == "Custom date":
+        return pd.Timestamp(opening_date, tz="UTC"), "custom"
+    funding = df[(df.wallet.isin(treasury_labels)) & (df.direction == "IN") &
+                 (df.counterparty_kind == "external")]
+    if not funding.empty:
+        return funding["timestamp"].min(), "first treasury funding"
+    if not df.empty:
+        return df["timestamp"].min(), "first activity, no treasury funding found"
+    return pd.Timestamp(opening_date, tz="UTC"), "custom"
+
+
+opening_ts, opening_basis = resolve_opening(ledger)
+
 comp = treasury_composition(ledger, treasury_labels, strategy_labels, opening_ts)
 strats = strategy_table(ledger, strategy_wallets, treasury_labels)
 
@@ -406,13 +425,44 @@ strategy_value = strats["Wallet value"].sum()
 total_capital = treasury_value + strategy_value
 net_deployed = strats["Net deployed"].sum()
 opening_total = ledger[ledger.timestamp <= opening_ts]["signed_usd"].sum()
+opening_treasury = ledger[(ledger.wallet.isin(treasury_labels)) &
+                          (ledger.timestamp <= opening_ts)]["signed_usd"].sum()
+opening_strategy = ledger[(ledger.wallet.isin(strategy_labels)) &
+                          (ledger.timestamp <= opening_ts)]["signed_usd"].sum()
+opening_capital = opening_treasury + opening_strategy
 external_in = ledger[(ledger.counterparty_kind == "external") &
                      (ledger.timestamp > opening_ts)]["signed_usd"].sum()
 share = net_deployed / total_capital * 100 if total_capital else float("nan")
 
+strategy_pnl = strategy_value - net_deployed
+# Deposits are not performance, so external funding is backed out of the change.
+change_vs_opening = total_capital - opening_capital - external_in
+change_pct = (change_vs_opening / opening_capital * 100) if opening_capital else float("nan")
+share_opening = (net_deployed / opening_capital * 100) if opening_capital else float("nan")
+
+
+def summary_rows() -> pd.DataFrame:
+    def pct(v):
+        return f"{v:.1f}%" if pd.notna(v) else "n/a"
+    rows = [
+        ("Opening treasury value (USD)", fmt_usd(opening_treasury)),
+        ("Opening strategy wallet value (USD)", fmt_usd(opening_strategy)),
+        ("Current treasury value (USD)", fmt_usd(treasury_value)),
+        ("Net deployed to strategies (USD)", fmt_usd(net_deployed)),
+        ("Reported strategy wallet value (USD)", fmt_usd(strategy_value)),
+        ("Strategy PnL (USD)", fmt_usd(strategy_pnl)),
+        ("Total: treasury + strategy wallets (USD)", fmt_usd(total_capital)),
+        ("External funding since opening (USD)", fmt_usd(external_in)),
+        ("Change vs opening (USD)", fmt_usd(change_vs_opening)),
+        ("Change vs opening (%)", pct(change_pct)),
+        ("Share of opening capital deployed", pct(share_opening)),
+    ]
+    return pd.DataFrame(rows, columns=["Summary", "Value"])
+
 st.caption(
     f"{chain_name} · live from {len(wallets)} wallets · {len(ledger)} counted transfers · "
-    f"{len(quarantine)} quarantined · opening {opening_ts:%d %b %Y}"
+    f"{len(quarantine)} quarantined · opening {opening_ts:%d %b %Y %H:%M} UTC "
+    f"({opening_basis})"
 )
 
 if not quarantine.empty:
@@ -434,12 +484,6 @@ r1[1].metric("Treasury value", fmt_usd(treasury_value))
 r1[2].metric("Strategy wallet value", fmt_usd(strategy_value))
 r1[3].metric("Net deployed", fmt_usd(net_deployed), help="Sent to strategies minus returned")
 
-r2 = st.columns(4)
-r2[0].metric("Opening capital", fmt_usd(opening_total))
-r2[1].metric("External funding since opening", fmt_usd(external_in))
-r2[2].metric("Share of capital deployed", f"{share:.1f}%" if pd.notna(share) else "-")
-r2[3].metric("Assets held", int((comp["Current qty"] > 0).sum()))
-
 tabs = st.tabs(["Overview", "Treasury", "Strategies", "Strategy detail",
                 "Transfer log", "Quarantine"])
 
@@ -451,39 +495,35 @@ with tabs[0]:
     a, b = st.columns([3, 2])
 
     with a:
-        st.subheader("Treasury composition")
-        deployed_by_asset = (tre_flows.groupby("asset")["signed_usd"].sum()
-                             if not tre_flows.empty else pd.Series(dtype=float))
-        parts = []
-        for _, r in comp.iterrows():
-            parts.append({"Asset": r["Asset"], "Bucket": "Held in treasury",
-                          "USD": float(r["Current value"])})
-            parts.append({"Asset": r["Asset"], "Bucket": "Deployed to strategies",
-                          "USD": float(deployed_by_asset.get(r["Asset"], 0.0))})
-        parts = pd.DataFrame(parts)
-        totals = parts.groupby("Asset", as_index=False)["USD"].sum().rename(
-            columns={"USD": "Asset total"})
-        parts = parts.merge(totals, on="Asset")
-        order = list(totals.sort_values("Asset total", ascending=False)["Asset"])
-
-        bars = alt.Chart(parts).mark_bar().encode(
-            y=alt.Y("Asset:N", title=None, sort=order),
-            x=alt.X("USD:Q", title="USD", axis=alt.Axis(format="$,.2f"), stack="zero"),
-            color=alt.Color("Bucket:N", title=None,
-                            scale=alt.Scale(domain=["Held in treasury",
-                                                    "Deployed to strategies"],
-                                            range=["#4C78A8", "#F0943E"]),
-                            legend=alt.Legend(orient="bottom")),
-            tooltip=["Asset", "Bucket", alt.Tooltip("USD:Q", format="$,.2f")])
-        labels = alt.Chart(totals).mark_text(align="left", dx=5, fontSize=11).encode(
-            y=alt.Y("Asset:N", sort=order),
-            x=alt.X("Asset total:Q"),
-            text=alt.Text("Asset total:Q", format="$,.2f"))
-        st.altair_chart((bars + labels).properties(height=330), use_container_width=True)
-        st.caption("Each asset split between what is still in treasury and what is "
-                   "currently out with strategy wallets.")
+        st.subheader("Summary")
+        st.dataframe(summary_rows(), hide_index=True, width="stretch")
+        st.caption("Opening capital is treasury plus strategy wallets at the opening "
+                   "date. External funding is backed out of the change, so deposits "
+                   "do not read as performance.")
+        if not pd.notna(change_pct):
+            st.caption("No balance at the opening date, so the percentages have no "
+                       "base. Move the opening date under Configuration.")
 
     with b:
+        st.subheader("Treasury composition by asset")
+        mix = comp[comp["Current value"].abs() > 1e-9][
+            ["Asset", "Current value", "% of treasury"]].copy()
+        if mix.empty:
+            st.caption("Treasury holds no counted assets.")
+        else:
+            donut = alt.Chart(mix).mark_arc(innerRadius=62).encode(
+                theta=alt.Theta("Current value:Q", stack=True),
+                color=alt.Color("Asset:N", title=None,
+                                legend=alt.Legend(orient="bottom", columns=3)),
+                tooltip=["Asset", alt.Tooltip("Current value:Q", format="$,.2f"),
+                         alt.Tooltip("% of treasury:Q", format=".1f")])
+            st.altair_chart(donut.properties(height=300), use_container_width=True)
+            st.caption(f"{len(mix)} stablecoin"
+                       f"{'s' if len(mix) != 1 else ''} · {fmt_usd(treasury_value)} held")
+
+    c, d = st.columns(2)
+
+    with c:
         st.subheader("Where the capital sits")
         split = pd.DataFrame({
             "bucket": ["Treasury (idle)"] + list(strats["Strategy wallet"]),
@@ -495,7 +535,31 @@ with tabs[0]:
                 color=alt.Color("bucket:N", title=None,
                                 legend=alt.Legend(orient="bottom", columns=1)),
                 tooltip=["bucket", alt.Tooltip("value:Q", format="$,.2f")]
-            ).properties(height=330),
+            ).properties(height=300),
+            use_container_width=True)
+
+    with d:
+        st.subheader("Deployed versus held, by asset")
+        deployed_by_asset = (tre_flows.groupby("asset")["signed_usd"].sum()
+                             if not tre_flows.empty else pd.Series(dtype=float))
+        parts = []
+        for _, r in comp.iterrows():
+            parts.append({"Asset": r["Asset"], "Bucket": "Held in treasury",
+                          "USD": float(r["Current value"])})
+            parts.append({"Asset": r["Asset"], "Bucket": "Out with strategies",
+                          "USD": float(deployed_by_asset.get(r["Asset"], 0.0))})
+        parts = pd.DataFrame(parts)
+        st.altair_chart(
+            alt.Chart(parts).mark_bar().encode(
+                y=alt.Y("Asset:N", title=None),
+                x=alt.X("USD:Q", title="USD", axis=alt.Axis(format="$,.2f"), stack="zero"),
+                color=alt.Color("Bucket:N", title=None,
+                                scale=alt.Scale(domain=["Held in treasury",
+                                                        "Out with strategies"],
+                                                range=["#4C78A8", "#F0943E"]),
+                                legend=alt.Legend(orient="bottom")),
+                tooltip=["Asset", "Bucket", alt.Tooltip("USD:Q", format="$,.2f")]
+            ).properties(height=300),
             use_container_width=True)
 
     st.subheader("Cumulative net deployed by strategy wallet")
