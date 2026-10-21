@@ -396,6 +396,11 @@ if ledger.empty:
 comp = treasury_composition(ledger, treasury_labels, strategy_labels, opening_ts)
 strats = strategy_table(ledger, strategy_wallets, treasury_labels)
 
+tre_flows = ledger[(ledger.wallet_kind == "strategy") &
+                   (ledger.counterparty_label.isin(treasury_labels))].sort_values("timestamp").copy()
+if not tre_flows.empty:
+    tre_flows["cumulative"] = tre_flows.groupby("wallet")["signed_usd"].cumsum()
+
 treasury_value = comp["Current value"].sum()
 strategy_value = strats["Wallet value"].sum()
 total_capital = treasury_value + strategy_value
@@ -446,33 +451,37 @@ with tabs[0]:
     a, b = st.columns([3, 2])
 
     with a:
-        st.subheader("Capital walk")
-        sent = strats["Sent"].sum()
-        ret = strats["Returned"].sum()
-        steps = [("Opening", opening_total, 0, opening_total, "total"),
-                 ("External funding", external_in, opening_total,
-                  opening_total + external_in, "up"),
-                 ("Sent to strategies", -sent, treasury_value, treasury_value + sent, "down"),
-                 ("Returned", ret, treasury_value - ret, treasury_value, "up"),
-                 ("Treasury now", treasury_value, 0, treasury_value, "total"),
-                 ("Strategy wallets", strategy_value, treasury_value, total_capital, "up"),
-                 ("Total capital", total_capital, 0, total_capital, "total")]
-        walk = pd.DataFrame(steps, columns=["step", "delta", "low", "high", "kind"])
-        base = alt.Chart(walk).encode(
-            x=alt.X("step:N", sort=list(walk["step"]), title=None,
-                    axis=alt.Axis(labelAngle=-25)))
-        st.altair_chart(
-            (base.mark_bar(size=38).encode(
-                y=alt.Y("low:Q", title="USD", axis=alt.Axis(format="$,.2f")), y2="high:Q",
-                color=alt.Color("kind:N", scale=alt.Scale(
-                    domain=["total", "up", "down"],
-                    range=["#4C78A8", "#54A24B", "#E45756"]), legend=None),
-                tooltip=[alt.Tooltip("step:N", title=""),
-                         alt.Tooltip("delta:Q", format="$,.2f")])
-             + base.mark_text(dy=-8, fontSize=10).encode(
-                 y="high:Q", text=alt.Text("delta:Q", format="$,.2f"))
-             ).properties(height=330),
-            use_container_width=True)
+        st.subheader("Treasury composition")
+        deployed_by_asset = (tre_flows.groupby("asset")["signed_usd"].sum()
+                             if not tre_flows.empty else pd.Series(dtype=float))
+        parts = []
+        for _, r in comp.iterrows():
+            parts.append({"Asset": r["Asset"], "Bucket": "Held in treasury",
+                          "USD": float(r["Current value"])})
+            parts.append({"Asset": r["Asset"], "Bucket": "Deployed to strategies",
+                          "USD": float(deployed_by_asset.get(r["Asset"], 0.0))})
+        parts = pd.DataFrame(parts)
+        totals = parts.groupby("Asset", as_index=False)["USD"].sum().rename(
+            columns={"USD": "Asset total"})
+        parts = parts.merge(totals, on="Asset")
+        order = list(totals.sort_values("Asset total", ascending=False)["Asset"])
+
+        bars = alt.Chart(parts).mark_bar().encode(
+            y=alt.Y("Asset:N", title=None, sort=order),
+            x=alt.X("USD:Q", title="USD", axis=alt.Axis(format="$,.2f"), stack="zero"),
+            color=alt.Color("Bucket:N", title=None,
+                            scale=alt.Scale(domain=["Held in treasury",
+                                                    "Deployed to strategies"],
+                                            range=["#4C78A8", "#F0943E"]),
+                            legend=alt.Legend(orient="bottom")),
+            tooltip=["Asset", "Bucket", alt.Tooltip("USD:Q", format="$,.2f")])
+        labels = alt.Chart(totals).mark_text(align="left", dx=5, fontSize=11).encode(
+            y=alt.Y("Asset:N", sort=order),
+            x=alt.X("Asset total:Q"),
+            text=alt.Text("Asset total:Q", format="$,.2f"))
+        st.altair_chart((bars + labels).properties(height=330), use_container_width=True)
+        st.caption("Each asset split between what is still in treasury and what is "
+                   "currently out with strategy wallets.")
 
     with b:
         st.subheader("Where the capital sits")
@@ -490,11 +499,7 @@ with tabs[0]:
             use_container_width=True)
 
     st.subheader("Cumulative net deployed by strategy wallet")
-    tre_flows = ledger[(ledger.wallet_kind == "strategy") &
-                       (ledger.counterparty_label.isin(treasury_labels))].copy()
     if not tre_flows.empty:
-        tre_flows = tre_flows.sort_values("timestamp")
-        tre_flows["cumulative"] = tre_flows.groupby("wallet")["signed_usd"].cumsum()
         st.altair_chart(
             alt.Chart(tre_flows).mark_line(interpolate="step-after", point=True).encode(
                 x=alt.X("timestamp:T", title=None),
